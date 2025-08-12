@@ -1,1 +1,485 @@
+*************  Proof of concept: Lorenz System  ***********************
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+import pysindy as ps
+
+sigma = 10.0
+rho = 28.0
+beta = 8.0 / 3.0
+
+# Define the Lorenz system
+def lorenz(t, state):
+    x, y, z = state
+    dxdt = sigma * (y - x)
+    dydt = x * (rho - z) - y
+    dzdt = x * y - beta * z
+    return [dxdt, dydt, dzdt]
+
+# Generate training data
+np.random.seed(42)
+initial_state = np.random.rand(3) * 30 - 15  # Random initial condition
+time_span = (0, 25)  # Time span for integration
+time_points = np.linspace(time_span[0], time_span[1], 10000)
+
+# Solve the Lorenz system
+solution = solve_ivp(lorenz, time_span, initial_state, t_eval=time_points)
+X = solution.y.T  # Transpose to match PySINDy format
+t = solution.t
+
+# Plot the true Lorenz attractor
+fig = plt.figure(figsize=(10, 7))
+ax = fig.add_subplot(111, projection='3d')
+ax.plot(X[:, 0], X[:, 1], X[:, 2], lw=0.5)
+ax.set_title("True Lorenz Attractor")
+ax.set_xlabel("x")
+ax.set_ylabel("y")
+ax.set_zlabel("z")
+plt.show()
+
+# Fit the SINDy model with polynomial and Fourier libraries
+optimizer = ps.STLSQ(threshold=0.1)  # Sparse regression
+feature_library = ps.GeneralizedLibrary([
+    ps.PolynomialLibrary(degree=3),
+    ps.FourierLibrary(n_frequencies=3)
+])
+model = ps.SINDy(optimizer=optimizer, feature_library=feature_library)
+
+# Train the model
+model.fit(X, t=t)
+model.print()
+
+# Predict and compare with true trajectory
+X_dot = model.differentiate(X, t)
+X_dot_pred = model.predict(X)
+
+# Plot the comparison
+plt.figure(figsize=(10, 7))
+plt.plot(t, X_dot[:, 0], label="True dx/dt", alpha=0.7)
+plt.plot(t, X_dot_pred[:, 0], label="Predicted dx/dt", linestyle="--")
+plt.xlabel("Time")
+plt.ylabel("dx/dt")
+plt.legend()
+plt.title("True vs Predicted Derivatives")
+plt.show()
+
+# Simulate using the SINDy model
+X_sindy = model.simulate(initial_state, t)
+
+# Plot comparison of trajectories
+fig = plt.figure(figsize=(10, 7))
+ax = fig.add_subplot(111, projection='3d')
+ax.plot(X[:, 0], X[:, 1], X[:, 2], lw=0.5, label="True")
+ax.plot(X_sindy[:, 0], X_sindy[:, 1], X_sindy[:, 2], lw=0.5, label="SINDy")
+ax.set_title("True vs SINDy Reconstructed Trajectories")
+ax.set_xlabel("x")
+ax.set_ylabel("y")
+ax.set_zlabel("z")
+ax.legend()
+plt.show()
+
+*************  Training of model using Synthetic datasets  ***********************
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_squared_error
+from scipy.integrate import cumulative_trapezoid
+import pysindy as ps
+
+# === Step 1: Load real training data ===
+data = pd.read_csv("pv_data3.csv", header=None)
+data.columns = ['time', 'I', 'G', 'T']
+#for multiple inputs
+data2 = pd.read_csv("pv_data4.csv", header=None)
+data2.columns = ['time', 'I', 'G', 'T']
+t = np.concatenate([data['time'].values,data2['time'].values+24])
+x=np.concatenate([data['I'].values, data2['I'].values]).reshape(-1,1)
+u = np.concatenate([data[['G', 'T']].values, data2[['G', 'T']].values])
+#------------------------------------------------------------------------------
+
+dt = t[1] - t[0]                                 # assuming uniform time step
+#x = data['I'].values.reshape(-1, 1)              # state: current I(t)
+#u = data[['G', 'T']].values                      # control inputs: G(t), T(t)
+
+# === Step 2: Define feature library ===
+library = ps.PolynomialLibrary(degree=4, include_interaction=True, include_bias=True) 
+
+# === Step 3: Create SINDy model with control ===
+model = ps.SINDy(
+    optimizer=ps.STLSQ(threshold=0.0001),
+    feature_library=library,
+    differentiation_method=ps.FiniteDifference(),
+    feature_names=["I", "G", "T"],
+    discrete_time=False
+)
+
+# === Step 4: Fit model using training data ===
+model.fit(x, u=u, t=dt)
+model.print()
+
+# === Step 5: Predict dI/dt and reconstruct I(t) ===
+dI_dt_pred = model.predict(x, u=u)
+I0 = x[0, 0]
+I_pred = cumulative_trapezoid(dI_dt_pred.flatten(), t, initial=0) + I0
+
+# === Step 6: Plot predicted vs true current ===
+plt.figure(figsize=(10, 6))
+plt.plot(t, x, label='True Current I(t)', linewidth=2)
+plt.plot(t, I_pred, '--', label='Predicted Current I(t)', linewidth=2)
+plt.xlabel("Time (s)")
+plt.ylabel("Current (A)")
+plt.title("SINDy with Control: True vs Predicted Current (Training Data)")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# === Step 7: Load test data ===
+test_data = pd.read_csv("pv_data7.csv", header=None)
+test_data.columns = ['time', 'I', 'G', 'T']
+
+t_test = test_data['time'].values
+x_test = test_data['I'].values.reshape(-1, 1)
+u_test = test_data[['G', 'T']].values
+
+# === Step 8: Predict dI/dt on test data ===
+dI_dt_test_pred = model.predict(x_test, u=u_test)
+
+# === Step 9: Integrate predicted dI/dt to get I(t) ===
+I0_test = x_test[0, 0]
+I_test_pred = cumulative_trapezoid(dI_dt_test_pred.flatten(), t_test, initial=0) + I0_test
+
+# === Step 10: Plot true vs predicted current on test data ===
+plt.figure(figsize=(10, 6))
+plt.plot(t_test, x_test, label='True Current I(t) [Test Data]', linewidth=2)
+plt.plot(t_test, I_test_pred, '--', label='Predicted Current I(t)', linewidth=2)
+plt.xlabel("Time (s)")
+plt.ylabel("Current (A)")
+plt.title("SINDy with Control: Predicted vs True Current (Test Data)")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# === Step 11: Calculate and print Mean Squared Error (MSE) ===
+
+mse = mean_squared_error(x_test, I_test_pred)
+print(f"Mean Squared Error (Test Data): {mse:.6f}")
+
+
+
+*************  Training of model using Real-time dataset  ***********************
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_squared_error
+from scipy.integrate import cumulative_trapezoid
+import pysindy as ps
+
+# === Step 1: Load real training data ===
+data = pd.read_csv("pvr_data4.csv", header=None)
+data.columns = ['time', 'I', 'G', 'T']
+
+#x=np.concatenate([data['I'].values, data2['I'].values]).reshape(-1,1)
+#u = np.concatenate([data[['G', 'T']].values, data2[['G', 'T']].values])
+#------------------------------------------------------------------------------
+t = data['time'].values
+dt = t[1] - t[0]                                 # assuming uniform time step
+x = data['I'].values.reshape(-1, 1)              # state: current I(t)
+u = data[['G', 'T']].values                      # control inputs: G(t), T(t)
+
+# === Step 2: Define feature library ===
+poly_library = ps.PolynomialLibrary(degree=4, include_interaction=True, include_bias=True)
+four_library = ps.FourierLibrary(n_frequencies = 34,include_sin = True, include_cos = True) 
+library = ps.GeneralizedLibrary([poly_library, four_library])
+
+# === Step 3: Create SINDy model with control ===
+model = ps.SINDy(
+    optimizer=ps.STLSQ(threshold=0.0001),
+    feature_library=library,
+    differentiation_method=ps.FiniteDifference(),
+    feature_names=["I", "G", "T"],
+    discrete_time=False
+)
+
+# === Step 4: Fit model using training data ===
+model.fit(x, u=u, t=dt)
+model.print()
+
+# === Step 5: Predict dI/dt and reconstruct I(t) ===
+dI_dt_pred = model.predict(x, u=u)
+I0 = x[0, 0]
+I_pred = cumulative_trapezoid(dI_dt_pred.flatten(), t, initial=0) + I0
+
+# === Step 6: Plot predicted vs true current ===
+plt.figure(figsize=(10, 6))
+plt.plot(t, x, label='True Current I(t)', linewidth=2)
+plt.plot(t, I_pred, '--', label='Predicted Current I(t)', linewidth=2)
+plt.xlabel("Time (s)")
+plt.ylabel("Current (A)")
+plt.title("SINDy with Control: True vs Predicted Current (Training Data)")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# === Step 7: Load test data ===
+test_data = pd.read_csv("pvr_data6.csv", header=None)
+test_data.columns = ['time', 'I', 'G', 'T']
+
+t_test = test_data['time'].values
+x_test = test_data['I'].values.reshape(-1, 1)
+u_test = test_data[['G', 'T']].values
+
+# === Step 8: Predict dI/dt on test data ===
+dI_dt_test_pred = model.predict(x_test, u=u_test)
+
+# === Step 9: Integrate predicted dI/dt to get I(t) ===
+I0_test = x_test[0, 0]
+I_test_pred = cumulative_trapezoid(dI_dt_test_pred.flatten(), t_test, initial=0) + I0_test
+
+# === Step 10: Plot true vs predicted current on test data ===
+plt.figure(figsize=(10, 6))
+plt.plot(t_test, x_test, label='True Current I(t) [Test Data]', linewidth=2)
+plt.plot(t_test, I_test_pred, '--', label='Predicted Current I(t)', linewidth=2)
+plt.xlabel("Time (s)")
+plt.ylabel("Current (A)")
+plt.title("SINDy with Control: Predicted vs True Current (Test Data)")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# === Step 11: Calculate and print Mean Squared Error (MSE) ===
+
+mse = mean_squared_error(x_test, I_test_pred)
+print(f"Mean Squared Error (Test Data): {mse:.6f}")
+
+
+*************  Training of model using Real-time datasets  ***********************
+import numpy as np 
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_squared_error
+from scipy.integrate import cumulative_trapezoid
+import pysindy as ps
+import datetime
+import matplotlib.dates as mdates
+
+# === Step 1: Load real training data ===
+data = pd.read_csv("pvr_data4.csv", header=None)
+data.columns = ['time', 'I', 'G', 'T']
+#for multiple inputs
+data2 = pd.read_csv("pvr_data5.csv", header=None)
+data2.columns = ['time', 'I', 'G', 'T']
+data3 = pd.read_csv("pvr_data7.csv", header=None)
+data3.columns = ['time', 'I', 'G', 'T']
+t = np.concatenate([data['time'].values,data2['time'].values+24 , data3['time'].values+48])
+x=np.concatenate([data['I'].values, data2['I'].values, data3['I'].values]).reshape(-1,1)
+u = np.concatenate([data[['G', 'T']].values, data2[['G', 'T']].values, data3[['G', 'T']].values])
+dt = t[1] - t[0]    
+
+# === Step 2: Define feature library ===
+poly_library = ps.PolynomialLibrary(degree=6, include_interaction=True, include_bias=True)
+four_library = ps.FourierLibrary(n_frequencies=90, include_sin=True, include_cos=True) 
+library = ps.GeneralizedLibrary([poly_library, four_library])
+
+# === Step 3: Create SINDy model with control ===
+model = ps.SINDy(
+    optimizer=ps.STLSQ(threshold=0.0001),
+    feature_library=library,
+    differentiation_method=ps.FiniteDifference(),
+    feature_names=["I", "G", "T"],
+    discrete_time=False
+)
+
+# === Step 4: Fit model using training data ===
+model.fit(x, u=u, t=dt)
+model.print()
+
+# === Step 5: Predict dI/dt and reconstruct I(t) ===
+dI_dt_pred = model.predict(x, u=u)
+I0 = x[0]
+I_pred = cumulative_trapezoid(dI_dt_pred.flatten(), t, initial=0) + I0
+
+# === Step 6: Plot predicted vs true current ===
+plt.figure(figsize=(10, 6))
+plt.plot(t, x, label='True Current I(t)', linewidth=2)
+plt.plot(t, I_pred, '--', label='Predicted Current I(t)', linewidth=2)
+plt.xlabel("Time (s)")
+plt.ylabel("Current (A)")
+plt.title("SINDy with Control: True vs Predicted Current (Training Data)")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# === Step 7: Load test data ===
+test_data = pd.read_csv("pvr_data6.csv", header=None)
+test_data.columns = ['time', 'I', 'G', 'T']
+
+t_test = test_data['time'].values
+x_test = test_data['I'].values.reshape(-1, 1)
+u_test = test_data[['G', 'T']].values
+
+# === Step 8: Predict dI/dt on test data ===
+dI_dt_test_pred = model.predict(x_test, u=u_test)
+
+# === Step 9: Integrate predicted dI/dt to get I(t) ===
+I0_test = x_test[0, 0]
+I_test_pred = cumulative_trapezoid(dI_dt_test_pred.flatten(), t_test, initial=0) + I0_test
+
+# === Step 10: Plot true vs predicted current on test data ===
+plt.figure(figsize=(10, 6))
+plt.plot(t_test, x_test, label='True Current I(t) [Test Data]', linewidth=2)
+plt.plot(t_test, I_test_pred, '--', label='Predicted Current I(t)', linewidth=2)
+plt.xlabel("Time (s)")
+plt.ylabel("Current (A)")
+plt.title("SINDy with Control: Predicted vs True Current (Test Data)")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# === Step 11: Calculate and print Mean Squared Error (MSE) ===
+
+mse = mean_squared_error(x_test, I_test_pred)
+print(f"Mean Squared Error (Test Data): {mse:.6f}")
+
+
+
+*************  Model Updation  ***********************
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_squared_error
+from scipy.integrate import cumulative_trapezoid
+import pysindy as ps
+
+# ===========================
+# Step 1: Load training data
+# ===========================
+data1 = pd.read_csv("pv_data1.csv", header=None)
+data1.columns = ['time', 'I', 'G', 'T']
+
+data2 = pd.read_csv("pv_data4.csv", header=None)
+data2.columns = ['time', 'I', 'G', 'T']
+
+# Concatenate training datasets
+t_train = np.concatenate([data1['time'].values, data2['time'].values + 24])
+x_train = np.concatenate([data1['I'].values, data2['I'].values]).reshape(-1, 1)
+u_train = np.concatenate([data1[['G', 'T']].values, data2[['G', 'T']].values])
+
+dt = t_train[1] - t_train[0]  # assuming uniform time step
+
+# ===========================
+# Step 2: Define feature library
+# ===========================
+library = ps.PolynomialLibrary(degree=4, include_interaction=True, include_bias=True) 
+
+# ===========================
+# Step 3: Create SINDy model with control
+# ===========================
+model = ps.SINDy(
+    optimizer=ps.STLSQ(threshold=0.0001),
+    feature_library=library,
+    differentiation_method=ps.FiniteDifference(),
+    feature_names=["I", "G", "T"],
+    discrete_time=False
+)
+
+# ===========================
+# Step 4: Fit initial model
+# ===========================
+model.fit(x_train, u=u_train, t=dt)
+print("\n--- Initial Model ---")
+model.print()
+
+# ===========================
+# Step 5: Predict & plot on training data
+# ===========================
+dI_dt_train_pred = model.predict(x_train, u=u_train)
+I0_train = x_train[0, 0]
+I_train_pred = cumulative_trapezoid(dI_dt_train_pred.flatten(), t_train, initial=0) + I0_train
+
+plt.figure(figsize=(10, 6))
+plt.plot(t_train, x_train, label='True Current I(t)', linewidth=2)
+plt.plot(t_train, I_train_pred, '--', label='Predicted Current I(t)', linewidth=2)
+plt.xlabel("Time (s)")
+plt.ylabel("Current (A)")
+plt.title("SINDy with Control: Training Data")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# ===========================
+# Step 6: Load update data
+# ===========================
+update_data = pd.read_csv("pv_data3.csv", header=None)
+update_data.columns = ['time', 'I', 'G', 'T']
+
+t_update = update_data['time'].values
+x_update = update_data['I'].values.reshape(-1, 1)
+u_update = update_data[['G', 'T']].values
+
+# ===========================
+# Step 7: Sliding-window retrain
+# ===========================
+window_fraction = 0.5  # Keep last 50% of old data
+window_size = int(len(x_train) * window_fraction)
+
+x_combined = np.vstack([x_train[-window_size:], x_update])
+u_combined = np.vstack([u_train[-window_size:], u_update])
+t_combined = np.concatenate([
+    t_train[-window_size:], 
+    t_update + t_train[-1] + dt  # shift update times
+])
+
+# Retrain model with combined data
+model.fit(x_combined, u=u_combined, t=dt)
+print("\n--- Model Updated with New Data ---")
+model.print()
+
+# ===========================
+# Step 8: Load test data
+# ===========================
+test_data = pd.read_csv("pv_data7.csv", header=None)
+test_data.columns = ['time', 'I', 'G', 'T']
+
+t_test = test_data['time'].values
+x_test = test_data['I'].values.reshape(-1, 1)
+u_test = test_data[['G', 'T']].values
+
+# ===========================
+# Step 9: Predict on test data
+# ===========================
+dI_dt_test_pred = model.predict(x_test, u=u_test)
+I0_test = x_test[0, 0]
+I_test_pred = cumulative_trapezoid(dI_dt_test_pred.flatten(), t_test, initial=0) + I0_test
+
+# ===========================
+# Step 10: Plot test prediction
+# ===========================
+plt.figure(figsize=(10, 6))
+plt.plot(t_test, x_test, label='True Current I(t) [Test Data]', linewidth=2)
+plt.plot(t_test, I_test_pred, '--', label='Predicted Current I(t)', linewidth=2)
+plt.xlabel("Time (s)")
+plt.ylabel("Current (A)")
+plt.title("SINDy with Control: Test Data After Update")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# ===========================
+# Step 11: Calculate MSE
+# ===========================
+mse = mean_squared_error(x_test, I_test_pred)
+print(f"\nMean Squared Error (Test Data After Update): {mse:.6f}")
+
+
+
+
 
